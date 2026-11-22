@@ -555,7 +555,7 @@ pub struct Role {
 
 /// A compute-managed service login. Unlike `Role`, this never receives Console
 /// user privilege defaults or implicit privileged-role membership.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RestrictedRole {
     pub name: PgIdent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -563,6 +563,20 @@ pub struct RestrictedRole {
     pub login: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_of: Vec<PgIdent>,
+}
+
+impl std::fmt::Debug for RestrictedRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestrictedRole")
+            .field("name", &self.name)
+            .field(
+                "encrypted_password",
+                &self.encrypted_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("login", &self.login)
+            .field("member_of", &self.member_of)
+            .finish()
+    }
 }
 
 /// Rust representation of Postgres database info with only those fields
