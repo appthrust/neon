@@ -9,7 +9,8 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, registry::LookupSpan};
 /// Initialize logging to stderr, and OpenTelemetry tracing and exporter.
 ///
 /// Logging is configured using either `default_log_level` or
-/// `RUST_LOG` environment variable as default log level.
+/// `RUST_LOG` environment variable as default log level. PostgreSQL driver
+/// DEBUG/TRACE output is always disabled because it can contain SQL credentials.
 ///
 /// OpenTelemetry is configured with OTLP/HTTP exporter. It picks up
 /// configuration from environment variables. For example, to change the destination,
@@ -67,12 +68,21 @@ pub fn init_tracing_and_logging(
         .with(otlp_layer)
         .with(fmt_layer)
         .with(json_to_file_layer)
+        .with(tracing_subscriber::filter::filter_fn(postgres_log_enabled))
         .init();
     tracing::info!("logging and tracing started");
 
     utils::logging::replace_panic_hook_with_tracing_panic_hook().forget();
 
     Ok((provider, _file_logs_guard))
+}
+
+// This global gate applies to every output layer. Unlike an EnvFilter directive,
+// it cannot be overridden by a more specific RUST_LOG target or span directive.
+fn postgres_log_enabled(metadata: &tracing::Metadata<'_>) -> bool {
+    let target = metadata.target();
+    !(target == "tokio_postgres" || target.starts_with("tokio_postgres::"))
+        || *metadata.level() <= tracing::Level::INFO
 }
 
 /// Replace all newline characters with a special character to make it
@@ -223,6 +233,84 @@ mod test {
 
         fn make_writer(&self) -> Self::Writer {
             Self
+        }
+    }
+
+    #[test]
+    fn test_tokio_postgres_sql_secrecy() {
+        for directives in [
+            "debug",
+            "trace",
+            "debug,tokio_postgres=trace",
+            "debug,tokio_postgres=info,tokio_postgres::simple_query=trace,tokio_postgres::query::bind=trace",
+            "debug,tokio_postgres[driver_sql]=trace,[sql_scope]=trace",
+        ] {
+            WRITER_OUTPUT.with(|s| s.borrow_mut().clear());
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::try_new(directives).unwrap())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_target(false)
+                        .without_time()
+                        .with_writer(StaticStringWriter),
+                )
+                .with(Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_target(false)
+                        .event_format(PgJsonLogShapeFormatter)
+                        .with_writer(StaticStringWriter),
+                ))
+                .with(tracing_subscriber::filter::filter_fn(postgres_log_enabled));
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info_span!(target: "compute_tools", "sql_scope").in_scope(|| {
+                    tracing::debug!(target: "tokio_postgres", "driver-sql-canary");
+                    tracing::trace!(target: "tokio_postgres", "driver-sql-canary");
+                    tracing::debug!(target: "tokio_postgres::simple_query", "driver-sql-canary");
+                    tracing::trace!(target: "tokio_postgres::simple_query", "driver-sql-canary");
+                    tracing::debug!(target: "tokio_postgres::query::bind", "driver-sql-canary");
+                    tracing::trace!(target: "tokio_postgres::query::bind", "driver-sql-canary");
+                    assert!(
+                        tracing::debug_span!(
+                            target: "tokio_postgres",
+                            "driver_sql",
+                            query = "driver-sql-canary"
+                        )
+                        .is_disabled()
+                    );
+                    assert!(
+                        tracing::trace_span!(
+                            target: "tokio_postgres::simple_query",
+                            "driver_sql",
+                            query = "driver-sql-canary"
+                        )
+                        .is_disabled()
+                    );
+                    tracing::info!(target: "tokio_postgres", "driver-info");
+                    tracing::warn!(target: "tokio_postgres::simple_query", "driver-warn");
+                    tracing::error!(target: "tokio_postgres::query::bind", "driver-error");
+                    tracing::debug!(target: "compute_tools", "application-debug");
+                    tracing::debug!(target: "unrelated_sql_driver", "unrelated-target-debug");
+                });
+            });
+
+            let output = WRITER_OUTPUT.with(|s| s.borrow().clone());
+            assert!(
+                !output.contains("driver-sql-canary"),
+                "{directives}: {output}"
+            );
+            for message in [
+                "driver-info",
+                "driver-warn",
+                "driver-error",
+                "application-debug",
+                "unrelated-target-debug",
+            ] {
+                // Both output layers must preserve permitted diagnostics.
+                assert_eq!(output.matches(message).count(), 2, "{directives}: {output}");
+            }
         }
     }
 

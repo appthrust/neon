@@ -305,6 +305,8 @@ impl ParsedSpec {
 impl TryFrom<ComputeSpec> for ParsedSpec {
     type Error = anyhow::Error;
     fn try_from(spec: ComputeSpec) -> Result<Self, anyhow::Error> {
+        validate_restricted_roles_mode(&spec)?;
+
         // Extract the options from the spec file that are needed to connect to
         // the storage system.
         //
@@ -1601,6 +1603,8 @@ impl ComputeNode {
     pub fn prepare_pgdata(&self, compute_state: &ComputeState) -> Result<()> {
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
         let spec = &pspec.spec;
+        validate_restricted_roles_mode(spec)?;
+
         let pgdata_path = Path::new(&self.params.pgdata);
 
         let tls_config = self.tls_config(&pspec.spec);
@@ -2088,6 +2092,7 @@ impl ComputeNode {
     #[instrument(skip_all)]
     pub fn reconfigure(&self) -> Result<()> {
         let spec = self.state.lock().unwrap().pspec.clone().unwrap().spec;
+        validate_restricted_roles_mode(&spec)?;
 
         let tls_config = self.tls_config(&spec);
 
@@ -2178,6 +2183,7 @@ impl ComputeNode {
     #[instrument(skip_all)]
     pub fn configure_as_primary(&self, compute_state: &ComputeState) -> Result<()> {
         let pspec = compute_state.pspec.as_ref().expect("spec must be set");
+        validate_restricted_roles_mode(&pspec.spec)?;
 
         assert!(pspec.spec.mode == ComputeMode::Primary);
         if !pspec.spec.skip_pg_catalog_updates {

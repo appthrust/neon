@@ -490,6 +490,17 @@ async fn apply_restricted_roles(
         return Ok(());
     }
     let transaction = client.transaction().await.map_err(restricted_sql_error)?;
+    // Keep these settings in a separate request, before any catalog reads or
+    // role DDL. A setup failure drops the transaction without sending role SQL.
+    transaction
+        .batch_execute(
+            "SET LOCAL log_min_error_statement = panic;
+             SET LOCAL log_statement = none;
+             SET LOCAL log_min_duration_statement = -1;
+             SET LOCAL track_activities = off;",
+        )
+        .await
+        .map_err(restricted_sql_error)?;
     let authority = transaction.query_one(
         "SELECT current_setting('server_version_num')::integer AS version,
                 (SELECT rolsuper FROM pg_catalog.pg_authid WHERE rolname = current_user) AS superuser,

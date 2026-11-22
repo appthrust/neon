@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
-use compute_api::spec::{ComputeSpec, DeltaOp, RestrictedRole, Role};
+use compute_api::spec::{ComputeMode, ComputeSpec, DeltaOp, RestrictedRole, Role};
+use compute_tools::compute::ParsedSpec;
 use compute_tools::pg_helpers::{
     RestrictedRoleMembership, RestrictedRoleState, RoleExt, plan_restricted_role,
-    plan_restricted_roles, validate_restricted_roles,
+    plan_restricted_roles, validate_restricted_roles, validate_restricted_roles_mode,
 };
+use utils::lsn::Lsn;
 
 const VERIFIER: &str = "SCRAM-SHA-256$4096:AQIDBAUGBwgJCgsMDQ4PEA==$8rrDg00OqaiWXJ7p+sCgHEIaBSHY89ZJl3mfIsf32oY=:05L1f+yZbiN8O0AnO40Og85NNRhvzTS57naKRWCcsIA=";
 const SAFE_FLAGS: &str = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS";
@@ -46,6 +48,82 @@ fn spec(roles: Vec<RestrictedRole>) -> ComputeSpec {
     let mut spec = ComputeSpec::default();
     spec.cluster.restricted_roles = roles;
     spec
+}
+
+#[test]
+fn restricted_roles_allow_primary_catalog_updates() {
+    for login in [false, true] {
+        let mut desired_role = role();
+        desired_role.login = login;
+        desired_role.encrypted_password = login.then(|| VERIFIER.into());
+        let desired = spec(vec![desired_role]);
+
+        validate_restricted_roles_mode(&desired).unwrap();
+        validate_restricted_roles(&desired, PRIVILEGED).unwrap();
+        assert!(
+            !plan_restricted_roles(
+                &desired,
+                &HashMap::new(),
+                &"bootstrap_admin".into(),
+                PRIVILEGED,
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+}
+
+#[test]
+fn restricted_roles_reject_skipped_catalog_updates() {
+    for mode in [
+        ComputeMode::Primary,
+        ComputeMode::Replica,
+        ComputeMode::Static(Lsn(42)),
+    ] {
+        for login in [false, true] {
+            let mut desired_role = role();
+            desired_role.login = login;
+            desired_role.encrypted_password = login.then(|| VERIFIER.into());
+            let mut desired = spec(vec![desired_role]);
+            desired.mode = mode;
+            desired.skip_pg_catalog_updates = true;
+
+            for result in [
+                validate_restricted_roles_mode(&desired),
+                validate_restricted_roles(&desired, PRIVILEGED),
+                ParsedSpec::try_from(desired).map(|_| ()),
+            ] {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "restricted roles require Primary mode and skip_pg_catalog_updates=false"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn restricted_roles_reject_replica_and_static_modes() {
+    for mode in [ComputeMode::Replica, ComputeMode::Static(Lsn(42))] {
+        for login in [false, true] {
+            let mut desired_role = role();
+            desired_role.login = login;
+            desired_role.encrypted_password = login.then(|| VERIFIER.into());
+            let mut desired = spec(vec![desired_role]);
+            desired.mode = mode;
+
+            for result in [
+                validate_restricted_roles_mode(&desired),
+                validate_restricted_roles(&desired, PRIVILEGED),
+                ParsedSpec::try_from(desired).map(|_| ()),
+            ] {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "restricted roles require Primary mode and skip_pg_catalog_updates=false"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -344,16 +422,28 @@ fn ordinary_only_specs_have_no_restricted_writes_and_keep_console_options() {
         encrypted_password: Some("abc123".into()),
         options: None,
     });
-    assert!(
-        plan_restricted_roles(
-            &desired,
-            &HashMap::new(),
-            &"bootstrap_admin".into(),
-            PRIVILEGED,
-        )
-        .unwrap()
-        .is_empty()
-    );
+    for mode in [
+        ComputeMode::Primary,
+        ComputeMode::Replica,
+        ComputeMode::Static(Lsn(42)),
+    ] {
+        for skip_pg_catalog_updates in [false, true] {
+            desired.mode = mode;
+            desired.skip_pg_catalog_updates = skip_pg_catalog_updates;
+            validate_restricted_roles_mode(&desired).unwrap();
+            validate_restricted_roles(&desired, PRIVILEGED).unwrap();
+            assert!(
+                plan_restricted_roles(
+                    &desired,
+                    &HashMap::new(),
+                    &"bootstrap_admin".into(),
+                    PRIVILEGED,
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+    }
     assert_eq!(
         desired.cluster.roles[0].to_pg_options(),
         " LOGIN PASSWORD 'md5abc123'"

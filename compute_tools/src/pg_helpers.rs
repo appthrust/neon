@@ -14,7 +14,7 @@ use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
 use compute_api::responses::TlsConfig;
 use compute_api::spec::{
-    ComputeSpec, Database, DatabricksSettings, GenericOption, GenericOptions, PgIdent,
+    ComputeMode, ComputeSpec, Database, DatabricksSettings, GenericOption, GenericOptions, PgIdent,
     RestrictedRole, Role,
 };
 use futures::StreamExt;
@@ -170,9 +170,21 @@ impl RoleExt for Role {
     }
 }
 
+/// Reject declarations that startup or reconfiguration would otherwise skip.
+/// This constant-time check is safe before any external side effects.
+pub fn validate_restricted_roles_mode(spec: &ComputeSpec) -> Result<()> {
+    if !spec.cluster.restricted_roles.is_empty()
+        && (spec.skip_pg_catalog_updates || spec.mode != ComputeMode::Primary)
+    {
+        bail!("restricted roles require Primary mode and skip_pg_catalog_updates=false");
+    }
+    Ok(())
+}
+
 /// Validate the opt-in service-role contract before opening a maintenance
 /// connection (which can itself execute SQL). Ordinary Console roles are untouched.
 pub fn validate_restricted_roles(spec: &ComputeSpec, privileged_role: &str) -> Result<()> {
+    validate_restricted_roles_mode(spec)?;
     if spec.cluster.restricted_roles.is_empty() {
         return Ok(());
     }
