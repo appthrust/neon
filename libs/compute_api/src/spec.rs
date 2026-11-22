@@ -518,6 +518,9 @@ pub struct Cluster {
     pub name: Option<String>,
     pub state: Option<String>,
     pub roles: Vec<Role>,
+    /// Service roles with explicit least-privilege login and membership state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restricted_roles: Vec<RestrictedRole>,
     pub databases: Vec<Database>,
 
     /// Desired contents of 'postgresql.conf' file. (The 'compute_ctl'
@@ -548,6 +551,18 @@ pub struct Role {
     pub name: PgIdent,
     pub encrypted_password: Option<String>,
     pub options: GenericOptions,
+}
+
+/// A compute-managed service login. Unlike `Role`, this never receives Console
+/// user privilege defaults or implicit privileged-role membership.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RestrictedRole {
+    pub name: PgIdent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_password: Option<String>,
+    pub login: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_of: Vec<PgIdent>,
 }
 
 /// Rust representation of Postgres database info with only those fields

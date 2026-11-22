@@ -787,6 +787,7 @@ impl Endpoint {
                     } else {
                         Vec::new()
                     },
+                    restricted_roles: Vec::new(),
                     databases: if args.create_test_user {
                         vec![Database {
                             name: PgIdent::from_str("neondb").unwrap(),
