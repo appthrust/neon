@@ -165,7 +165,15 @@ RUN case $DEBIAN_VERSION in \
     && apt clean && rm -rf /var/lib/apt/lists/* \
     && useradd -ms /bin/bash nonroot -b /home \
     # Install protoc from binary release, since Debian's versions are too old.
-    && curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-$(uname -m | sed 's/aarch64/aarch_64/g').zip" -o "protoc.zip" \
+    # AppThrust: the archive is verified against a pinned sha256 (v25.1 assets,
+    # recorded 2026-11-22); changing PROTOC_VERSION requires new digests.
+    && case "$(uname -m)" in \
+         x86_64) protoc_arch=x86_64; protoc_sha256=ed8fca87a11c888fed329d6a59c34c7d436165f662a2c875246ddb1ac2b6dd50 ;; \
+         aarch64) protoc_arch=aarch_64; protoc_sha256=99975a8c11b83cd65c3e1151ae1714bf959abc0521acb659bf720524276ab0c8 ;; \
+         *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip" -o "protoc.zip" \
+    && echo "${protoc_sha256}  protoc.zip" | sha256sum -c - \
     && unzip -q protoc.zip -d protoc \
     && mv protoc/bin/protoc /usr/local/bin/protoc \
     && mv protoc/include/google /usr/local/include/google \
@@ -1079,9 +1087,18 @@ WORKDIR /home/nonroot
 # See comment on the top of the file regading `echo` and `\n`
 RUN echo -e "--retry-connrefused\n--connect-timeout 15\n--retry 5\n--max-time 300\n" > /home/nonroot/.curlrc
 
-RUN curl -sSO https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init && \
+# AppThrust: rustup-init is pinned to 1.29.3 and verified against the official
+# static.rust-lang.org/rustup/archive/1.29.3/<target>/rustup-init.sha256; the
+# toolchain is the rust-toolchain.toml channel (1.88.0), not a moving "stable".
+RUN case "$(uname -m)" in \
+      x86_64) rustup_sha256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;; \
+      aarch64) rustup_sha256=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSo rustup-init "https://static.rust-lang.org/rustup/archive/1.29.3/$(uname -m)-unknown-linux-gnu/rustup-init" && \
+    echo "${rustup_sha256}  rustup-init" | sha256sum -c - && \
     chmod +x rustup-init && \
-    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain stable && \
+    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.88.0 && \
     rm rustup-init
 
 #########################################################################################
