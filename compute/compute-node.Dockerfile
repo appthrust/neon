@@ -132,8 +132,18 @@ RUN case $DEBIAN_VERSION in \
       # The h3_pg extension needs a cmake 3.20+, but Debian bullseye has 3.18.
       # Install newer version (3.25) from backports.
       # libstdc++-10-dev is required for plv8
+      # Bullseye packages moved off deb.debian.org; bootstrap CA trust
+      # through Debian's signed HTTP archive before switching to HTTPS.
       bullseye) \
+        printf '%s\n' \
+          'deb http://archive.debian.org/debian bullseye main' \
+          'deb http://archive.debian.org/debian-security bullseye-security main' > /etc/apt/sources.list; \
         echo "deb http://archive.debian.org/debian bullseye-backports main" > /etc/apt/sources.list.d/bullseye-backports.list; \
+        apt-get update --error-on=any && apt-get install --no-install-recommends -y ca-certificates || exit 1; \
+        printf '%s\n' \
+          'deb https://archive.debian.org/debian bullseye main' \
+          'deb https://archive.debian.org/debian-security bullseye-security main' > /etc/apt/sources.list; \
+        echo "deb https://archive.debian.org/debian bullseye-backports main" > /etc/apt/sources.list.d/bullseye-backports.list; \
         VERSION_INSTALLS="cmake/bullseye-backports cmake-data/bullseye-backports libstdc++-10-dev"; \
       ;; \
       # Version-specific installs for Bookworm (PG17):
@@ -144,7 +154,7 @@ RUN case $DEBIAN_VERSION in \
         echo "Unknown Debian version ${DEBIAN_VERSION}" && exit 1 \
       ;; \
     esac && \
-    apt update &&  \
+    apt-get update --error-on=any && \
     apt install --no-install-recommends --no-install-suggests -y \
     ninja-build git autoconf automake libtool build-essential bison flex libreadline-dev \
     zlib1g-dev libxml2-dev libcurl4-openssl-dev libossp-uuid-dev wget ca-certificates pkg-config libssl-dev \
