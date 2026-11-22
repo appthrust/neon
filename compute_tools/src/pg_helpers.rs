@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
 use std::fs::File;
@@ -10,9 +10,12 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use base64::Engine as _;
+use base64::prelude::BASE64_STANDARD;
 use compute_api::responses::TlsConfig;
 use compute_api::spec::{
-    Database, DatabricksSettings, GenericOption, GenericOptions, PgIdent, Role,
+    ComputeSpec, Database, DatabricksSettings, GenericOption, GenericOptions, PgIdent,
+    RestrictedRole, Role,
 };
 use futures::StreamExt;
 use indexmap::IndexMap;
@@ -165,6 +168,255 @@ impl RoleExt for Role {
 
         params
     }
+}
+
+/// Validate the opt-in service-role contract before opening a maintenance
+/// connection (which can itself execute SQL). Ordinary Console roles are untouched.
+pub fn validate_restricted_roles(spec: &ComputeSpec, privileged_role: &str) -> Result<()> {
+    if spec.cluster.restricted_roles.is_empty() {
+        return Ok(());
+    }
+    let mut names = HashSet::with_capacity(spec.cluster.restricted_roles.len());
+    for role in &spec.cluster.restricted_roles {
+        validate_restricted_role(role, privileged_role)?;
+        if !names.insert(role.name.as_str()) {
+            bail!("duplicate restricted role name");
+        }
+        if spec
+            .cluster
+            .roles
+            .iter()
+            .any(|ordinary| ordinary.name == role.name)
+        {
+            bail!("restricted role overlaps an ordinary role");
+        }
+    }
+    let mut groups = HashSet::new();
+    for role in &spec.cluster.restricted_roles {
+        for group in &role.member_of {
+            if names.contains(group.as_str())
+                || spec
+                    .cluster
+                    .roles
+                    .iter()
+                    .any(|ordinary| ordinary.name == *group)
+            {
+                bail!("restricted membership must name an independent group role");
+            }
+            groups.insert(group.as_str());
+        }
+    }
+    for op in spec.delta_operations.iter().flatten() {
+        if matches!(op.action.as_str(), "rename_role" | "delete_role")
+            && std::iter::once(&op.name)
+                .chain(op.new_name.iter())
+                .any(|name| names.contains(name.as_str()) || groups.contains(name.as_str()))
+        {
+            bail!("role delta operation conflicts with restricted roles");
+        }
+    }
+    if spec
+        .local_proxy_config
+        .iter()
+        .flat_map(|config| &config.jwks)
+        .flatten()
+        .flat_map(|jwks| &jwks.role_names)
+        .any(|name| names.contains(name.as_str()))
+    {
+        bail!("restricted role overlaps a JWKS role");
+    }
+    Ok(())
+}
+
+fn validate_restricted_role(role: &RestrictedRole, privileged_role: &str) -> Result<()> {
+    validate_restricted_role_name(&role.name, privileged_role)?;
+    if role.login
+        && !role
+            .encrypted_password
+            .as_deref()
+            .is_some_and(valid_scram_verifier)
+    {
+        bail!("restricted LOGIN role requires a valid SCRAM-SHA-256 verifier");
+    }
+    // A disabled slot cannot retain a verifier, even if its input is otherwise valid.
+    if !role.login && role.encrypted_password.is_some() {
+        bail!("restricted NOLOGIN role must not contain a password");
+    }
+    let mut groups = HashSet::with_capacity(role.member_of.len());
+    for group in &role.member_of {
+        validate_restricted_role_name(group, privileged_role)?;
+        if group == &role.name || !groups.insert(group) {
+            bail!("restricted role has a self or duplicate membership");
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_restricted_role_name(name: &str, privileged_role: &str) -> Result<()> {
+    // PostgreSQL silently truncates identifiers beyond NAMEDATALEN - 1.
+    if name.is_empty() || name.len() > 63 || name.contains('\0') {
+        bail!("invalid restricted role identifier");
+    }
+    if name == privileged_role
+        || name.starts_with("pg_")
+        || matches!(name, "postgres" | "cloud_admin" | "zenith_admin")
+    {
+        bail!("restricted role references a protected role");
+    }
+    Ok(())
+}
+
+/// Strictly recognize PostgreSQL SCRAM secrets. Passing any other string to
+/// PASSWORD would make PostgreSQL hash it as plaintext rather than reject it.
+fn valid_scram_verifier(secret: &str) -> bool {
+    let Some(secret) = secret.strip_prefix("SCRAM-SHA-256$") else {
+        return false;
+    };
+    let Some((iterations, secret)) = secret.split_once(':') else {
+        return false;
+    };
+    if iterations.is_empty()
+        || !iterations.bytes().all(|c| c.is_ascii_digit())
+        || !iterations.parse::<i32>().is_ok_and(|n| n > 0)
+    {
+        return false;
+    }
+    let Some((salt, keys)) = secret.split_once('$') else {
+        return false;
+    };
+    if salt.is_empty() || salt.len() % 4 != 0 {
+        return false;
+    }
+    // Validate arbitrarily sized salts without allocating a decoded copy.
+    let mut decoded = [0u8; 3];
+    let mut chunks = salt.as_bytes().chunks_exact(4).peekable();
+    while let Some(chunk) = chunks.next() {
+        match BASE64_STANDARD.decode_slice(chunk, &mut decoded) {
+            Ok(3) => {}
+            Ok(1 | 2) if chunks.peek().is_none() => {}
+            _ => return false,
+        }
+    }
+    let Some((stored_key, server_key)) = keys.split_once(':') else {
+        return false;
+    };
+    let mut key = [0u8; 33];
+    [stored_key, server_key].into_iter().all(|encoded| {
+        encoded.len() == 44 && BASE64_STANDARD.decode_slice(encoded, &mut key) == Ok(32)
+    })
+}
+
+/// Catalog state is intentionally separate from Console's password-only Role.
+/// Do not derive Debug: both this state and the resulting SQL contain verifiers.
+#[derive(Default)]
+pub struct RestrictedRoleState {
+    pub login: bool,
+    pub inherit: bool,
+    pub superuser: bool,
+    pub create_role: bool,
+    pub create_db: bool,
+    pub replication: bool,
+    pub bypass_rls: bool,
+    pub encrypted_password: Option<String>,
+    pub memberships: Vec<RestrictedRoleMembership>,
+}
+
+pub struct RestrictedRoleMembership {
+    pub name: PgIdent,
+    pub grantor: PgIdent,
+    pub admin: bool,
+    pub inherit: bool,
+    pub set: bool,
+}
+
+impl RestrictedRoleState {
+    pub fn has_admin_attributes(&self) -> bool {
+        self.superuser || self.create_role || self.create_db || self.replication || self.bypass_rls
+    }
+}
+
+/// Plan exact PG16+ direct memberships, including membership options. Only grants
+/// owned by the bootstrap superuser are managed: PostgreSQL attributes superuser
+/// GRANTs to that role (user.c:check_role_grantor). Foreign grants fail closed.
+pub fn plan_restricted_role(
+    role: &RestrictedRole,
+    observed: Option<&RestrictedRoleState>,
+    grantor: &PgIdent,
+    privileged_role: &str,
+) -> Result<Vec<String>> {
+    validate_restricted_role(role, privileged_role)?;
+    let mut queries = Vec::new();
+    let name = role.name.pg_quote();
+    if observed.is_none_or(|state| {
+        state.login != role.login
+            || state.inherit
+            || state.has_admin_attributes()
+            || state.encrypted_password != role.encrypted_password
+    }) {
+        let password = role
+            .encrypted_password
+            .as_deref()
+            .map(escape_literal)
+            .unwrap_or_else(|| "NULL".to_owned());
+        queries.push(format!(
+            "{} ROLE {name} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS {} PASSWORD {password}",
+            if observed.is_some() { "ALTER" } else { "CREATE" },
+            if role.login { "LOGIN" } else { "NOLOGIN" },
+        ));
+    }
+    if let Some(state) = observed {
+        for membership in &state.memberships {
+            if &membership.grantor != grantor {
+                bail!("restricted role has an unowned membership");
+            }
+            if !role.member_of.contains(&membership.name) {
+                // No CASCADE: dependent grants must fail rather than modify other roles.
+                queries.push(format!(
+                    "REVOKE {} FROM {name} GRANTED BY {} RESTRICT",
+                    membership.name.pg_quote(),
+                    grantor.pg_quote(),
+                ));
+            }
+        }
+    }
+    for group in &role.member_of {
+        let membership = observed.and_then(|state| {
+            state
+                .memberships
+                .iter()
+                .find(|membership| &membership.name == group)
+        });
+        if membership
+            .is_none_or(|membership| membership.admin || membership.inherit || !membership.set)
+        {
+            queries.push(format!(
+                "GRANT {} TO {name} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY {}",
+                group.pg_quote(),
+                grantor.pg_quote(),
+            ));
+        }
+    }
+    Ok(queries)
+}
+
+/// Validate and plan the whole collection before any role DDL is executed.
+pub fn plan_restricted_roles(
+    spec: &ComputeSpec,
+    observed: &HashMap<PgIdent, RestrictedRoleState>,
+    grantor: &PgIdent,
+    privileged_role: &str,
+) -> Result<Vec<String>> {
+    validate_restricted_roles(spec, privileged_role)?;
+    let mut queries = Vec::new();
+    for role in &spec.cluster.restricted_roles {
+        queries.extend(plan_restricted_role(
+            role,
+            observed.get(&role.name),
+            grantor,
+            privileged_role,
+        )?);
+    }
+    Ok(queries)
 }
 
 pub trait DatabaseExt {

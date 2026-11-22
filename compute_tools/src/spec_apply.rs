@@ -4,20 +4,21 @@ use std::future::Future;
 use std::iter::{empty, once};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use compute_api::responses::ComputeStatus;
 use compute_api::spec::{ComputeAudit, ComputeSpec, Database, PgIdent, Role};
 use futures::future::join_all;
 use tokio::sync::RwLock;
-use tokio_postgres::Client;
 use tokio_postgres::error::SqlState;
+use tokio_postgres::{Client, GenericClient};
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use crate::compute::{ComputeNode, ComputeNodeParams, ComputeState, create_databricks_roles};
 use crate::hadron_metrics::COMPUTE_CONFIGURE_STATEMENT_TIMEOUT_ERRORS;
 use crate::pg_helpers::{
-    DatabaseExt, Escaping, GenericOptionsSearch, RoleExt, get_existing_dbs_async,
-    get_existing_roles_async,
+    DatabaseExt, Escaping, GenericOptionsSearch, RestrictedRoleMembership, RestrictedRoleState,
+    RoleExt, get_existing_dbs_async, get_existing_roles_async, plan_restricted_roles,
+    validate_restricted_role_name, validate_restricted_roles,
 };
 use crate::spec_apply::ApplySpecPhase::{
     AddDatabricksGrants, AlterDatabricksRoles, CreateAndAlterDatabases, CreateAndAlterRoles,
@@ -44,12 +45,13 @@ impl ComputeNode {
         concurrency: usize,
     ) -> Result<()> {
         info!("Applying config with max {} concurrency", concurrency);
-        debug!("Config: {:?}", spec);
+        validate_restricted_roles(&spec, &self.params.privileged_role_name)?;
 
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             // Proceed with post-startup configuration. Note, that order of operations is important.
-            let client = Self::get_maintenance_client(&conf).await?;
+            let mut client = Self::get_maintenance_client(&conf).await?;
+            apply_restricted_roles(&mut client, &spec, &self.params.privileged_role_name).await?;
             let spec = spec.clone();
             let params = Arc::new(self.params.clone());
 
@@ -474,6 +476,195 @@ impl ComputeNode {
                 .unwrap_or(3)
         }
     }
+}
+
+/// Unlike Console role operations, restricted-role SQL must never be logged or
+/// pipelined with unrelated DDL. A single transaction includes planning, writes,
+/// and catalog readback; any error prevents apply_spec_sql from succeeding.
+async fn apply_restricted_roles(
+    client: &mut Client,
+    spec: &ComputeSpec,
+    privileged_role: &str,
+) -> Result<()> {
+    if spec.cluster.restricted_roles.is_empty() {
+        return Ok(());
+    }
+    let transaction = client.transaction().await.map_err(restricted_sql_error)?;
+    let authority = transaction.query_one(
+        "SELECT current_setting('server_version_num')::integer AS version,
+                (SELECT rolsuper FROM pg_catalog.pg_authid WHERE rolname = current_user) AS superuser,
+                (SELECT rolname FROM pg_catalog.pg_authid WHERE oid = 10) AS grantor",
+        &[],
+    ).await.map_err(restricted_sql_error)?;
+    if authority.get::<_, i32>("version") < 160000 || !authority.get::<_, bool>("superuser") {
+        bail!("restricted roles require PostgreSQL 16+ and a superuser maintenance connection");
+    }
+    let grantor: PgIdent = authority.get("grantor");
+    let names: Vec<&str> = spec
+        .cluster
+        .restricted_roles
+        .iter()
+        .map(|role| role.name.as_str())
+        .collect();
+    if names.contains(&grantor.as_str()) {
+        bail!("restricted role references the bootstrap superuser");
+    }
+    let groups: HashSet<&str> = spec
+        .cluster
+        .restricted_roles
+        .iter()
+        .flat_map(|role| role.member_of.iter().map(String::as_str))
+        .collect();
+    let groups: Vec<&str> = groups.into_iter().collect();
+    validate_restricted_groups(&transaction, &groups, spec, privileged_role).await?;
+    let observed = read_restricted_roles(&transaction, &names).await?;
+    let queries = plan_restricted_roles(spec, &observed, &grantor, privileged_role)?;
+    for query in queries {
+        transaction
+            .batch_execute(&query)
+            .await
+            .map_err(restricted_sql_error)?;
+    }
+    // REVOKE can succeed with only a warning when it does not own a grant.
+    // Never report success based solely on DDL command completion.
+    let observed = read_restricted_roles(&transaction, &names).await?;
+    if !plan_restricted_roles(spec, &observed, &grantor, privileged_role)?.is_empty() {
+        bail!("restricted role catalog readback did not converge");
+    }
+    validate_restricted_groups(&transaction, &groups, spec, privileged_role).await?;
+    transaction.commit().await.map_err(restricted_sql_error)?;
+    Ok(())
+}
+
+// PostgreSQL errors can contain the statement, DETAIL or CONTEXT with a verifier.
+// Preserve only SQLSTATE; neither the query nor the original error is chained.
+fn restricted_sql_error(error: tokio_postgres::Error) -> anyhow::Error {
+    anyhow!(
+        "restricted role SQL failed (SQLSTATE {})",
+        error.code().map_or("unavailable", SqlState::code),
+    )
+}
+
+async fn read_restricted_roles(
+    client: &impl GenericClient,
+    names: &[&str],
+) -> Result<HashMap<PgIdent, RestrictedRoleState>> {
+    let rows = client
+        .query(
+            "SELECT rolname, rolcanlogin, rolinherit, rolsuper, rolcreaterole,
+                rolcreatedb, rolreplication, rolbypassrls, rolpassword
+         FROM pg_catalog.pg_authid WHERE rolname::text = ANY($1::text[])",
+            &[&names],
+        )
+        .await
+        .map_err(restricted_sql_error)?;
+    let mut roles = HashMap::with_capacity(rows.len());
+    for row in rows {
+        roles.insert(
+            row.get("rolname"),
+            RestrictedRoleState {
+                login: row.get("rolcanlogin"),
+                inherit: row.get("rolinherit"),
+                superuser: row.get("rolsuper"),
+                create_role: row.get("rolcreaterole"),
+                create_db: row.get("rolcreatedb"),
+                replication: row.get("rolreplication"),
+                bypass_rls: row.get("rolbypassrls"),
+                encrypted_password: row.get("rolpassword"),
+                memberships: Vec::new(),
+            },
+        );
+    }
+    let memberships = client
+        .query(
+            "SELECT member.rolname AS member, parent.rolname AS parent,
+                grantor.rolname AS grantor, m.admin_option, m.inherit_option, m.set_option
+         FROM pg_catalog.pg_auth_members m
+         JOIN pg_catalog.pg_authid member ON member.oid = m.member
+         JOIN pg_catalog.pg_authid parent ON parent.oid = m.roleid
+         JOIN pg_catalog.pg_authid grantor ON grantor.oid = m.grantor
+         WHERE member.rolname::text = ANY($1::text[])",
+            &[&names],
+        )
+        .await
+        .map_err(restricted_sql_error)?;
+    for row in memberships {
+        let member: String = row.get("member");
+        let state = roles
+            .get_mut(&member)
+            .context("restricted role changed during catalog observation")?;
+        state.memberships.push(RestrictedRoleMembership {
+            name: row.get("parent"),
+            grantor: row.get("grantor"),
+            admin: row.get("admin_option"),
+            inherit: row.get("inherit_option"),
+            set: row.get("set_option"),
+        });
+    }
+    Ok(roles)
+}
+
+async fn validate_restricted_groups(
+    client: &impl GenericClient,
+    groups: &[&str],
+    spec: &ComputeSpec,
+    privileged_role: &str,
+) -> Result<()> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+    // Follow only ancestors of declared groups. UNION (not UNION ALL) also
+    // bounds the query if a corrupted catalog contains a membership cycle.
+    let rows = client
+        .query(
+            "WITH RECURSIVE ancestors(oid) AS (
+             SELECT oid FROM pg_catalog.pg_authid WHERE rolname::text = ANY($1::text[])
+             UNION
+             SELECT m.roleid FROM pg_catalog.pg_auth_members m
+             JOIN ancestors a ON a.oid = m.member
+         )
+         SELECT r.rolname, r.rolcanlogin, r.rolsuper, r.rolcreaterole, r.rolcreatedb,
+                r.rolreplication, r.rolbypassrls
+         FROM pg_catalog.pg_authid r JOIN ancestors a ON a.oid = r.oid",
+            &[&groups],
+        )
+        .await
+        .map_err(restricted_sql_error)?;
+    let mut found = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let name: PgIdent = row.get("rolname");
+        validate_restricted_role_name(&name, privileged_role)?;
+        if spec
+            .cluster
+            .restricted_roles
+            .iter()
+            .any(|role| role.name == name)
+            || spec.cluster.roles.iter().any(|role| role.name == name)
+            || [
+                "rolcanlogin",
+                "rolsuper",
+                "rolcreaterole",
+                "rolcreatedb",
+                "rolreplication",
+                "rolbypassrls",
+            ]
+            .iter()
+            .any(|column| row.get::<_, bool>(*column))
+        {
+            bail!("restricted membership reaches an unsafe group role");
+        }
+        if spec.delta_operations.iter().flatten().any(|op| {
+            matches!(op.action.as_str(), "rename_role" | "delete_role")
+                && (op.name == name || op.new_name.as_ref() == Some(&name))
+        }) {
+            bail!("role delta operation conflicts with restricted group ancestry");
+        }
+        found.insert(name);
+    }
+    if groups.iter().any(|group| !found.contains(*group)) {
+        bail!("restricted membership group does not exist");
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
